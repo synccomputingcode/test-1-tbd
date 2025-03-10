@@ -1,0 +1,165 @@
+name: Build
+
+on:
+# Remove 'workflow_dispatch', if you don't want to manually run the job
+  workflow_dispatch:
+
+# Runs on ALL pushes
+# Ignores README.md and VERSION files. VERSION is included to keep the build from 
+# running when the VERSION file is updated by the build process.
+  push:
+    paths-ignore:
+      - 'README.md'
+      - 'VERSION'
+# Runs on all branches except 'release' branches. This keeps the build from running
+# when releases are created.
+    branches:
+      - '**'
+      - '!releases/**'
+
+jobs:
+  build:
+# 'ubuntu-lastest' will run on Github's infrastructure.
+# Change to [ self-hosted, aws-runner-west ] if using AWS resources.
+# Google equivilant is [ self-hosted, google-runner-central ]
+# NOTE: If using the TestHelper class then run on Google
+    runs-on: [ self-hosted, google-runner-central ]
+
+# The matrix runs the build for the specified versions. Not all python versions
+# are supported. 
+# Supported versions: https://github.com/actions/python-versions/releases
+    strategy:
+      matrix:
+        python-version: [3.8,3.9]
+# Set a global environment variable. 
+    env:
+      SQLALCHEMY_URI: ${{ secrets.SQLALCHEMY_URI }}
+# Spin up a postgres docker instances
+    services:
+      postgres:
+        image: postgres:latest
+        env:
+          POSTGRES_DB: ${{ secrets.POSTGRES_DB }} 
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+        ports:
+          - 5432:5432
+        # Set health checks to wait until postgres has started
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+# removes sonarcloud files. They are created as root causing the build to fail
+# when checking out the code in the following step.
+    - name: Remove Sonarcloud files
+      run: sudo rm -rf .scannerwork || true
+
+# Code checkout. This is required
+    - uses: actions/checkout@v2
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v2
+      with:
+        python-version: ${{ matrix.python-version }}
+
+# Install base dependencies
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Run migrations
+      run: |
+        export PYTHONPATH=$GITHUB_WORKSPACE
+        alembic upgrade head
+
+# Run tests. This example uses TestHelper package stored in Google Artifact.
+# The first coverage execution runs the tests and formats the output in a format
+# compatible with the 'Publish Unit Test Results' step.
+# The second coverage execution, 'coverage xml' generates a file suitable for
+# Sonarcloud. The output name defaults to 'coverage.xml'.
+    - name: Test with pytest
+      run: |
+        python -m pip install --upgrade pip
+        pip install keyring keyrings.google-artifactregistry-auth
+        pip install -r tests/requirements.txt
+        coverage run -m pytest --junitxml=coverage-reports/coverage-results.xml
+        coverage xml
+
+# Publish the test results to Github.
+    - name: Publish Unit Test Results
+      uses: EnricoMi/publish-unit-test-result-action@v1
+      if: always()
+      with:
+        files: coverage-reports/*.xml
+
+# Publish results to Sonarcloud. 
+# Need to add secret SONAR_TOKEN to your repo.
+# GITHUB_TOKEN secret is an organizational secret so it's built in.
+    - name: SonarCloud Scan
+      if: always()
+      uses: SonarSource/sonarcloud-github-action@master
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+# Always send a slack notification
+    - name: Slack Notification
+      if: always()
+      uses: 8398a7/action-slack@v3
+      with:
+       status: ${{ job.status }}
+       fields: repo,message,commit,author,action,eventName,ref,workflow,job,took
+       channel: '#ci_cd_pipelines'
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+
+# Tag the commit when it's made to main.
+# This block runs on Github infrastructure as it's Github only work.
+  tag_version:
+    if: github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+
+# The code needs to be checked out.
+    steps:
+    - uses: actions/checkout@v2
+      with:
+        token: "${{ secrets.CI_API_TOKEN }}"
+
+# Check if the VERSION file was changed by the developer. If not, increment, and 
+# notify the build process of the change.
+    - name: Increment Version - if same as prior commit
+      run: |
+        VERSION_CHANGE=$(${GITHUB_WORKSPACE}/.github/workflows/diff_script.sh)
+        echo "VERSION_CHANGE=$VERSION_CHANGE" >> $GITHUB_ENV
+        echo "VERSION=$(cat VERSION)" >>$GITHUB_ENV
+  
+# Push the new VERSION to Github.
+    - name: Commit Updated Version File
+      if: env.VERSION_CHANGE == 1
+      uses: EndBug/add-and-commit@v7.4.0
+      with:
+        add: 'VERSION'
+        message: 'Updated VERSION file to version ${{ env.VERSION }}'
+
+# Create a release based on the VERSION file.
+    - name: Set Tag Name
+      id: set_tag
+      run: |
+        TAG="release-${{ env.VERSION }}"
+        git tag $TAG
+        git push origin --tags
+
+# Send a slack notification
+    - name: Slack Notification
+      if: always()
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        fields: repo,message,commit,author,action,eventName,ref,workflow,jobtook
+        channel: '#ci_cd_pipelines'
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
