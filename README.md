@@ -1,6 +1,8 @@
 # template_repo
 Template for Creating Other Repos - Python Based
 
+Edit for open pr
+
 This repo contains the basics for a new, Python-based repo.
 
 It includes:
